@@ -3,8 +3,13 @@
 Сансара — бот учёта смен и процедур
 Запуск: python bot.py
 """
+import os
+import json
 import logging
 from datetime import datetime
+
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -23,6 +28,66 @@ TOKEN = "8960632739:AAFnJBzn-89ctfWOiImkk24bbjpTWZqGZPk"
 # Узнать свой ID: написать боту @userinfobot
 # После итога смены туда придёт копия.
 ADMIN_CHAT_ID = None  # например: 123456789
+
+# ─────────────────────── GOOGLE SHEETS ────────────────────────────
+SPREADSHEET_ID = "1YLGV-Lprd5HZ7wwph728zPgISaVjPflhjlleZbV2Sco"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _get_journal():
+    """Возвращает лист Журнал. Поддерживает credentials.json и env-переменную."""
+    creds = None
+    # Вариант 1: файл credentials.json рядом с bot.py
+    if os.path.exists("credentials.json"):
+        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    # Вариант 2: JSON в переменной окружения GOOGLE_CREDENTIALS_JSON (Railway)
+    elif os.getenv("GOOGLE_CREDENTIALS_JSON"):
+        info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    if creds is None:
+        return None
+
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    return sh.worksheet("Журнал")
+
+def write_shift(s: dict):
+    """Записывает все позиции закрытой смены в лист Журнал."""
+    try:
+        ws = _get_journal()
+        if ws is None:
+            logger.warning("Google Sheets не подключены — пропускаем запись.")
+            return
+
+        date_str = s["date"]
+        day   = int(date_str.split(".")[0])
+        month = int(date_str.split(".")[1])
+        year  = int(date_str.split(".")[2])
+        period = "1-15" if day <= 15 else "16-31"
+        role   = "мастер" if s["role"] == "мастер" else "техпер"
+        cat    = CATALOGUE[s["role"]][s["branch"]]
+
+        rows = []
+        rates_dict = dict(cat["ставки"])
+        for pos, qty in s["ставки"].items():
+            price = rates_dict.get(pos, 0)
+            rows.append([date_str, s["name"], role, s["branch"], "ставка",
+                         pos, qty, price, price * qty,
+                         period, day, month, year])
+
+        if s.get("процедуры") and "процедуры" in cat:
+            procs_dict = dict(cat["процедуры"])
+            for pos, qty in s["процедуры"].items():
+                price = procs_dict.get(pos, 0)
+                rows.append([date_str, s["name"], role, s["branch"], "процедура",
+                             pos, qty, price, price * qty,
+                             period, day, month, year])
+
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+            logger.info(f"Google Sheets: записано {len(rows)} строк для {s['name']}")
+    except Exception as e:
+        logger.error(f"Ошибка записи в Google Sheets: {e}")
 
 # ─────────────────────────── СОСТОЯНИЯ ────────────────────────────
 CHOOSE_ROLE, CHOOSE_NAME, CHOOSE_BRANCH, MAIN_MENU, \
@@ -329,6 +394,9 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Закрываем смену
     summary = fmt(s, final=True)
     await q.edit_message_text(summary + "\n\n✅ Смена закрыта. Спасибо!")
+
+    # Записываем в Google Sheets
+    write_shift(s)
 
     if ADMIN_CHAT_ID:
         await ctx.bot.send_message(chat_id=ADMIN_CHAT_ID, text=summary)
