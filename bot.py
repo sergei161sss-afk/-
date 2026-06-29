@@ -574,7 +574,18 @@ def main():
         logger.error(f"[ERROR] {ctx.error}", exc_info=ctx.error)
     app.add_error_handler(err)
     logger.info("Бот Сансара v3 запущен")
-    app.run_polling(drop_pending_updates=True)
+    webhook_url = os.getenv("WEBHOOK_URL", "")
+    port = int(os.getenv("PORT", "8080"))
+    if webhook_url:
+        logger.info(f"Webhook mode: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+    else:
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
