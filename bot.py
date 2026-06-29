@@ -1299,6 +1299,8 @@ def main():
             CommandHandler("start", cmd_start),
             CommandHandler("reset", cmd_reset),
             CallbackQueryHandler(on_new_shift, pattern="^new_shift$"),
+            CallbackQueryHandler(on_register_name, pattern="^reg_name_"),
+            CallbackQueryHandler(on_register_role, pattern="^reg_role_"),
         ],
         states={
             REGISTER_NAME: [
