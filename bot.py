@@ -448,6 +448,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_register_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: выбор имени → переход к выбору роли."""
     q = update.callback_query
+    logger.info(f"[on_register_name] data={q.data} user={update.effective_user.id}")
     await q.answer()
     name = q.data.replace("reg_name_", "")
     ctx.user_data["reg_name"] = name
@@ -956,8 +957,19 @@ def main():
         per_chat=True,
     )
 
+    # Catch-all: ловит любые callback которые не обработал ConversationHandler
+    async def debug_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        logger.warning(f"[UNHANDLED callback] data={q.data} user={update.effective_user.id}")
+        await q.answer("⚠️ Попробуйте /start или /reset")
+
+    async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+        logger.error(f"[ERROR] {ctx.error}", exc_info=ctx.error)
+
     app.add_handler(conv)
     app.add_handler(CommandHandler("setup_rv", cmd_setup_rv))
+    app.add_handler(CallbackQueryHandler(debug_callback))  # catch-all, ниже приоритетом
+    app.add_error_handler(error_handler)
     logger.info("Бот Сансара v2 запущен ✅")
     app.run_polling(drop_pending_updates=True)
 
