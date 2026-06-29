@@ -284,6 +284,12 @@ def name_kb() -> ReplyKeyboardMarkup:
         rows.append([KeyboardButton(n) for n in ALL_NAMES[i:i+3]])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
+def role_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(v)] for v in ROLE_LABELS.values()]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+ROLE_BY_LABEL = {v: k for k, v in ROLE_LABELS.items()}
+
 def _qty_str(q: float) -> str:
     return str(int(q)) if q == int(q) else str(q)
 
@@ -339,21 +345,27 @@ async def on_register_name(update, ctx):
         return REGISTER_NAME
     logger.info(f"[on_register_name] name={name} user={update.effective_user.id}")
     ctx.user_data["reg_name"] = name
-    await update.message.reply_text(f"{name}\n\nТеперь выберите роль:", reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_text("Выберите роль:", reply_markup=kb([(v, f"reg_role_{k}") for k, v in ROLE_LABELS.items()], cols=1))
+    await update.message.reply_text(f"Имя: {name}\n\nВыберите роль:", reply_markup=role_kb())
     return REGISTER_ROLE
 
 async def on_register_role(update, ctx):
-    q = update.callback_query
-    await q.answer()
-    role = q.data.replace("reg_role_", "")
+    text = update.message.text.strip()
+    role = ROLE_BY_LABEL.get(text)
+    if role is None:
+        await update.message.reply_text("Выберите роль из кнопок ниже.", reply_markup=role_kb())
+        return REGISTER_ROLE
+    logger.info(f"[on_register_role] role={role} user={update.effective_user.id}")
     name = ctx.user_data.get("reg_name", "")
     tid = update.effective_user.id
     user = {"name": name, "role": role}
     set_user(tid, user)
     ctx.user_data["user"] = user
-    await q.edit_message_text(
-        f"Профиль создан!\n{name} — {ROLE_LABELS[role]}\n\nВыберите действие:",
+    await update.message.reply_text(
+        f"Профиль создан!\n{name} — {ROLE_LABELS[role]}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "Выберите действие:",
         reply_markup=kb([("Начать смену", "start_shift"), ("Мой профиль", "go_profile")], cols=1),
     )
     return PROFILE_MENU
@@ -640,7 +652,7 @@ def main():
         ],
         states={
             REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_register_name)],
-            REGISTER_ROLE: [CallbackQueryHandler(on_register_role, pattern="^reg_role_")],
+            REGISTER_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_register_role)],
             PROFILE_MENU: [CallbackQueryHandler(on_profile_menu, pattern="^(go_profile|change_role|setrole_.+|change_name|newname_.+|confirmname_.+|start_shift)$")],
             CHOOSE_BRANCH: [CallbackQueryHandler(on_branch, pattern="^br_")],
             LOCATION_CHECK: [MessageHandler(filters.LOCATION, on_location)],
