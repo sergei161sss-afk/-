@@ -3,9 +3,8 @@
 Сансара — бот учёта смен v4
 - Без ConversationHandler (единый on_callback)
 - Пользователи синхронизируются в Google Sheets «Пользователи»
-  → данные не теряются при редеплое
 - После закрытия смены: запись в «Журнал» + сводка администратору
-- Webhook-режим на Railway, polling — локально
+- Webhook на Railway (url_path=TOKEN), polling — локально
 """
 import os, json, logging
 from datetime import datetime
@@ -416,8 +415,7 @@ async def cmd_reset(update, ctx):
 async def cmd_myid(update, ctx):
     cid = update.effective_chat.id
     await update.message.reply_text(
-        f"Ваш Chat ID: `{cid}`\n\n"
-        "Добавьте переменную `ADMIN_CHAT_ID` в Railway Variables.",
+        f"Ваш Chat ID: `{cid}`\n\nДобавьте переменную `ADMIN_CHAT_ID` в Railway Variables.",
         parse_mode="Markdown",
     )
 
@@ -435,14 +433,13 @@ async def on_callback(update, ctx):
         logger.error(f"[cb ERROR] user={tid} data={data} err={e}", exc_info=True)
         try:
             await q.edit_message_text(
-                "⚠️ Произошла ошибка. Попробуйте /start",
+                "⚠️ Ошибка. Нажмите /start",
                 reply_markup=kb([("🔄 Начать заново", "restart")]),
             )
         except Exception:
             pass
 
 async def _handle(q, ctx, data: str, tid: int):
-    # ── restart ──────────────────────────────────────────────────────────────
     if data == "restart":
         user = get_user(tid)
         if user:
@@ -455,7 +452,6 @@ async def _handle(q, ctx, data: str, tid: int):
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
         return
 
-    # ── Выбор имени ──────────────────────────────────────────────────────────
     if data.startswith("rn_"):
         name = data[3:]
         if ctx.user_data.get("changing_name"):
@@ -471,11 +467,10 @@ async def _handle(q, ctx, data: str, tid: int):
         else:
             ctx.user_data["reg_name"] = name
             await q.edit_message_text(
-                f"👤 Имя: {name}\n\nТеперь выберите роль:", reply_markup=roles_kb()
+                f"👤 Имя: {name}\n\nВыберите роль:", reply_markup=roles_kb()
             )
         return
 
-    # ── Выбор роли ───────────────────────────────────────────────────────────
     if data.startswith("rr_"):
         role = data[3:]
         if role not in ROLE_LABELS:
@@ -488,8 +483,7 @@ async def _handle(q, ctx, data: str, tid: int):
             set_user(tid, user)
             ctx.user_data["user"] = user
             await q.edit_message_text(
-                f"✅ Роль изменена: {ROLE_LABELS[role]}",
-                reply_markup=profile_kb(),
+                f"✅ Роль изменена: {ROLE_LABELS[role]}", reply_markup=profile_kb(),
             )
         else:
             name = ctx.user_data.get("reg_name", "")
@@ -506,7 +500,6 @@ async def _handle(q, ctx, data: str, tid: int):
             )
         return
 
-    # ── Профиль ───────────────────────────────────────────────────────────────
     if data == "go_profile":
         user = ctx.user_data.get("user") or get_user(tid)
         if not user:
@@ -531,7 +524,6 @@ async def _handle(q, ctx, data: str, tid: int):
         await q.edit_message_text("Выберите новую роль:", reply_markup=roles_kb())
         return
 
-    # ── Начало смены ─────────────────────────────────────────────────────────
     if data == "start_shift":
         ctx.user_data.pop("changing_name", None)
         ctx.user_data.pop("changing_role", None)
@@ -564,7 +556,6 @@ async def _handle(q, ctx, data: str, tid: int):
         )
         return
 
-    # ── Меню смены ────────────────────────────────────────────────────────────
     s = sess(ctx)
 
     if data == "show":
@@ -582,10 +573,7 @@ async def _handle(q, ctx, data: str, tid: int):
         role_in_shift = s.get("role", user["role"])
         await q.edit_message_text(
             f"👤 {user['name']}\nРоль: {ROLE_LABELS.get(role_in_shift, role_in_shift)}",
-            reply_markup=kb([
-                ("🔄 Сменить роль в смене", "sr_shift"),
-                ("◀️ Назад", "back_main"),
-            ], cols=1),
+            reply_markup=kb([("🔄 Сменить роль в смене", "sr_shift"), ("◀️ Назад", "back_main")], cols=1),
         )
         return
 
@@ -605,10 +593,7 @@ async def _handle(q, ctx, data: str, tid: int):
         set_user(tid, user)
         ctx.user_data["user"] = user
         s["role"] = role
-        await q.edit_message_text(
-            f"✅ Роль изменена: {ROLE_LABELS[role]}",
-            reply_markup=main_kb(role),
-        )
+        await q.edit_message_text(f"✅ Роль изменена: {ROLE_LABELS[role]}", reply_markup=main_kb(role))
         return
 
     if data == "back_main":
@@ -629,19 +614,11 @@ async def _handle(q, ctx, data: str, tid: int):
             await q.edit_message_text("Смена не открыта. Нажмите /start")
             return
         cat = CATALOGUE.get(s.get("role", ""), {}).get(s.get("branch", ""), {})
-        if data == "add_rate":
-            items = cat.get("ставки", [])
-            prefix = "r"
-            title = "➕ Ставки / подготовка:"
-        else:
-            items = cat.get("процедуры", [])
-            prefix = "p"
-            title = "➕ Процедуры:"
+        prefix = "r" if data == "add_rate" else "p"
+        items = cat.get("ставки" if data == "add_rate" else "процедуры", [])
+        title = "➕ Ставки / подготовка:" if data == "add_rate" else "➕ Процедуры:"
         if not items:
-            await q.edit_message_text(
-                "Нет позиций для этой роли/филиала.",
-                reply_markup=kb([("◀️ Назад", "back_main")])
-            )
+            await q.edit_message_text("Нет позиций.", reply_markup=kb([("◀️ Назад", "back_main")]))
             return
         ctx.user_data["cur_items"] = items
         ctx.user_data["cur_prefix"] = prefix
@@ -677,8 +654,8 @@ async def _handle(q, ctx, data: str, tid: int):
         if data == "qty_back":
             items = ctx.user_data.get("cur_items", [])
             prefix = ctx.user_data.get("cur_prefix", "r")
-            btns = _item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")]
             title = "➕ Ставки / подготовка:" if prefix == "r" else "➕ Процедуры:"
+            btns = _item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")]
             await q.edit_message_text(title, reply_markup=kb(btns, cols=1))
             return
         name = ctx.user_data.get("cur_name", "")
@@ -706,7 +683,6 @@ async def _handle(q, ctx, data: str, tid: int):
         )
         return
 
-    # ── Закрытие смены ────────────────────────────────────────────────────────
     if data == "close":
         if not s.get("branch"):
             await q.edit_message_text("Смена не открыта. Нажмите /start")
@@ -727,22 +703,18 @@ async def _handle(q, ctx, data: str, tid: int):
         s["end_time"] = end_time
         summary = fmt(s, final=True) + f"\n⏱ Конец: {end_time}"
         await q.edit_message_text(summary + "\n\n✅ Смена закрыта. Спасибо!")
-        # Записать в Sheets
         write_shift(s)
-        # Уведомить администратора
         if ADMIN_CHAT_ID:
             try:
                 await q.get_bot().send_message(ADMIN_CHAT_ID, summary)
             except Exception as e:
                 logger.error(f"Не удалось отправить сводку: {e}")
-        # Сбросить сессию смены, сохранить профиль
         user = ctx.user_data.get("user") or get_user(tid)
         ctx.user_data.clear()
         if user:
             ctx.user_data["user"] = user
-        chat_id = q.message.chat_id
         await q.get_bot().send_message(
-            chat_id,
+            q.message.chat_id,
             "Хотите начать новую смену?",
             reply_markup=kb([("🚀 Новая смена", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
         )
@@ -770,11 +742,14 @@ def main():
 
     logger.info("Бот Сансара v4 запускается...")
     if webhook_url:
-        logger.info(f"Webhook: {webhook_url}")
+        # PTB слушает по пути /{TOKEN}, поэтому и Telegram должен слать туда же
+        full_webhook_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
+        logger.info(f"Webhook URL: {full_webhook_url}")
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
-            webhook_url=webhook_url,
+            url_path=TOKEN,
+            webhook_url=full_webhook_url,
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
         )
