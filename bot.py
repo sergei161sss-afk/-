@@ -7,7 +7,7 @@
 - После закрытия смены: запись в «Журнал» + сводка администратору
 - Webhook-режим на Railway, polling — локально
 """
-import os, json, math, logging
+import os, json, logging
 from datetime import datetime
 
 import gspread
@@ -24,7 +24,7 @@ SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0")) or None
 USERS_FILE     = "users.json"
 
-# ─── Google Sheets ────────────────────────────────────────────────────────────
+# ── Google Sheets ─────────────────────────────────────────────────────────────
 
 def _get_creds():
     if os.path.exists("credentials.json"):
@@ -41,7 +41,6 @@ def _open_sheet():
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 
 def _users_ws(sh):
-    """Получить/создать лист «Пользователи»."""
     titles = [w.title for w in sh.worksheets()]
     if "Пользователи" not in titles:
         ws = sh.add_worksheet("Пользователи", rows=200, cols=3)
@@ -49,7 +48,7 @@ def _users_ws(sh):
         return ws
     return sh.worksheet("Пользователи")
 
-# ─── Хранение пользователей: local JSON + Sheets ──────────────────────────────
+# ── Хранение пользователей ────────────────────────────────────────────────────
 
 def _load_local() -> dict:
     if os.path.exists(USERS_FILE):
@@ -68,10 +67,9 @@ def _save_local(users: dict):
         logger.warning(f"Не удалось сохранить users.json: {e}")
 
 def sync_users_from_sheets():
-    """Загрузить пользователей из Sheets при старте (если local пуст)."""
     local = _load_local()
     if local:
-        logger.info(f"Локально {len(local)} пользователей, Sheets не грузим.")
+        logger.info(f"Локально {len(local)} пользователей.")
         return
     try:
         sh = _open_sheet()
@@ -99,7 +97,6 @@ def set_user(tid: int, data: dict):
     users = _load_local()
     users[str(tid)] = data
     _save_local(users)
-    # Асинхронно дублируем в Sheets (best-effort)
     try:
         sh = _open_sheet()
         if sh is None:
@@ -115,11 +112,10 @@ def set_user(tid: int, data: dict):
         logger.error(f"set_user sheets sync: {e}")
 
 def write_shift(s: dict):
-    """Записать смену в лист «Журнал»."""
     try:
         sh = _open_sheet()
         if sh is None:
-            logger.warning("Google Sheets не подключены — пропускаем запись.")
+            logger.warning("Google Sheets не подключены.")
             return
         ws = sh.worksheet("Журнал")
         date_str = s["date"]
@@ -140,13 +136,11 @@ def write_shift(s: dict):
                          pos, qty, price, round(price * qty, 2), period, day, month, year])
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
-            logger.info(f"Sheets «Журнал»: {len(rows)} строк для {s['name']}")
-        else:
-            logger.warning(f"Смена {s['name']} пустая — в Sheets не записываем.")
+            logger.info(f"Журнал: {len(rows)} строк для {s['name']}")
     except Exception as e:
         logger.error(f"write_shift: {e}")
 
-# ─── Данные ───────────────────────────────────────────────────────────────────
+# ── Данные ────────────────────────────────────────────────────────────────────
 
 ALL_NAMES = [
     "Сергей", "Станислав", "Антон", "Игорь",
@@ -293,7 +287,7 @@ CATALOGUE = {
     },
 }
 
-# ─── Вспомогательные функции ──────────────────────────────────────────────────
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def kb(buttons: list, cols: int = 2) -> InlineKeyboardMarkup:
     rows = []
@@ -378,7 +372,7 @@ def _item_buttons(items, prefix, s):
         btns.append((f"{mark}{name} +{price}{qty_str}", f"{prefix}_{i}"))
     return btns
 
-# ─── Команды ──────────────────────────────────────────────────────────────────
+# ── Команды ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update, ctx):
     tid = update.effective_user.id
@@ -403,7 +397,6 @@ async def cmd_reset(update, ctx):
     users = _load_local()
     users.pop(str(tid), None)
     _save_local(users)
-    # Удалить из Sheets тоже
     try:
         sh = _open_sheet()
         if sh:
@@ -424,12 +417,11 @@ async def cmd_myid(update, ctx):
     cid = update.effective_chat.id
     await update.message.reply_text(
         f"Ваш Chat ID: `{cid}`\n\n"
-        "Добавьте переменную `ADMIN_CHAT_ID={cid}` в Railway Variables "
-        "чтобы получать сводки по сменам.",
+        "Добавьте переменную `ADMIN_CHAT_ID` в Railway Variables.",
         parse_mode="Markdown",
     )
 
-# ─── Единый обработчик кнопок ─────────────────────────────────────────────────
+# ── Единый обработчик кнопок ──────────────────────────────────────────────────
 
 async def on_callback(update, ctx):
     q = update.callback_query
@@ -437,7 +429,6 @@ async def on_callback(update, ctx):
     data = q.data
     tid = update.effective_user.id
     logger.info(f"[cb] user={tid} data={data}")
-
     try:
         await _handle(q, ctx, data, tid)
     except Exception as e:
@@ -451,24 +442,23 @@ async def on_callback(update, ctx):
             pass
 
 async def _handle(q, ctx, data: str, tid: int):
-    # ── restart ──
+    # ── restart ──────────────────────────────────────────────────────────────
     if data == "restart":
         user = get_user(tid)
         if user:
             ctx.user_data["user"] = user
             await q.edit_message_text(
-                f"👋 С возвращением, {user['name']}!",
-                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Мой профиль", "go_profile")], cols=1),
+                f"👋 {user['name']}! Выберите действие:",
+                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
             )
         else:
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
         return
 
-    # ── Выбор имени (регистрация или смена имени) ──
+    # ── Выбор имени ──────────────────────────────────────────────────────────
     if data.startswith("rn_"):
         name = data[3:]
         if ctx.user_data.get("changing_name"):
-            # Смена имени у зарегистрированного пользователя
             ctx.user_data.pop("changing_name", None)
             user = ctx.user_data.get("user") or get_user(tid) or {}
             user["name"] = name
@@ -479,21 +469,19 @@ async def _handle(q, ctx, data: str, tid: int):
                 reply_markup=profile_kb(),
             )
         else:
-            # Первичная регистрация
             ctx.user_data["reg_name"] = name
             await q.edit_message_text(
                 f"👤 Имя: {name}\n\nТеперь выберите роль:", reply_markup=roles_kb()
             )
         return
 
-    # ── Выбор роли (регистрация или смена роли) ──
+    # ── Выбор роли ───────────────────────────────────────────────────────────
     if data.startswith("rr_"):
         role = data[3:]
         if role not in ROLE_LABELS:
             await q.edit_message_text("Выберите роль:", reply_markup=roles_kb())
             return
         if ctx.user_data.get("changing_role"):
-            # Смена роли у зарегистрированного пользователя
             ctx.user_data.pop("changing_role", None)
             user = ctx.user_data.get("user") or get_user(tid) or {}
             user["role"] = role
@@ -504,7 +492,6 @@ async def _handle(q, ctx, data: str, tid: int):
                 reply_markup=profile_kb(),
             )
         else:
-            # Первичная регистрация
             name = ctx.user_data.get("reg_name", "")
             if not name:
                 await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
@@ -515,11 +502,11 @@ async def _handle(q, ctx, data: str, tid: int):
             ctx.user_data.pop("reg_name", None)
             await q.edit_message_text(
                 f"✅ Профиль создан!\n👤 {name}\n🎭 {ROLE_LABELS[role]}\n\nВыберите действие:",
-                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Мой профиль", "go_profile")], cols=1),
+                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
             )
         return
 
-    # ── Профиль ──
+    # ── Профиль ───────────────────────────────────────────────────────────────
     if data == "go_profile":
         user = ctx.user_data.get("user") or get_user(tid)
         if not user:
@@ -544,7 +531,7 @@ async def _handle(q, ctx, data: str, tid: int):
         await q.edit_message_text("Выберите новую роль:", reply_markup=roles_kb())
         return
 
-    # ── Начало смены ──
+    # ── Начало смены ─────────────────────────────────────────────────────────
     if data == "start_shift":
         ctx.user_data.pop("changing_name", None)
         ctx.user_data.pop("changing_role", None)
@@ -577,12 +564,12 @@ async def _handle(q, ctx, data: str, tid: int):
         )
         return
 
-    # ── Меню смены ──
+    # ── Меню смены ────────────────────────────────────────────────────────────
     s = sess(ctx)
 
     if data == "show":
         if not s.get("branch"):
-            await q.edit_message_text("Смена не открыта. Нажмите /start", reply_markup=None)
+            await q.edit_message_text("Смена не открыта. Нажмите /start")
             return
         await q.edit_message_text(fmt(s), reply_markup=main_kb(s["role"]))
         return
@@ -626,7 +613,6 @@ async def _handle(q, ctx, data: str, tid: int):
 
     if data == "back_main":
         if not s.get("branch"):
-            user = ctx.user_data.get("user") or get_user(tid)
             await q.edit_message_text(
                 "Выберите действие:",
                 reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
@@ -652,7 +638,10 @@ async def _handle(q, ctx, data: str, tid: int):
             prefix = "p"
             title = "➕ Процедуры:"
         if not items:
-            await q.edit_message_text("Нет позиций для этой роли/филиала.", reply_markup=kb([("◀️ Назад", "back_main")]))
+            await q.edit_message_text(
+                "Нет позиций для этой роли/филиала.",
+                reply_markup=kb([("◀️ Назад", "back_main")])
+            )
             return
         ctx.user_data["cur_items"] = items
         ctx.user_data["cur_prefix"] = prefix
@@ -696,12 +685,12 @@ async def _handle(q, ctx, data: str, tid: int):
         price = ctx.user_data.get("cur_price", 0)
         prefix = ctx.user_data.get("cur_prefix", "r")
         if not name:
-            await q.edit_message_text("◀️ Назад", reply_markup=kb([("◀️ Назад", "back_main")]))
+            await q.edit_message_text("Назад", reply_markup=kb([("◀️ Назад", "back_main")]))
             return
         bucket = s.get("ставки", {}) if prefix == "r" else s.get("процедуры", {})
         delta_map = {"qty_p1": 1.0, "qty_p05": 0.5, "qty_m1": -1.0, "qty_m05": -0.5}
         delta = delta_map.get(data, 0)
-        new_qty = max(0, bucket.get(name, 0) + delta)
+        new_qty = max(0.0, bucket.get(name, 0) + delta)
         if new_qty == 0:
             bucket.pop(name, None)
         else:
@@ -717,7 +706,7 @@ async def _handle(q, ctx, data: str, tid: int):
         )
         return
 
-    # ── Закрытие смены ──
+    # ── Закрытие смены ────────────────────────────────────────────────────────
     if data == "close":
         if not s.get("branch"):
             await q.edit_message_text("Смена не открыта. Нажмите /start")
@@ -746,13 +735,14 @@ async def _handle(q, ctx, data: str, tid: int):
                 await q.get_bot().send_message(ADMIN_CHAT_ID, summary)
             except Exception as e:
                 logger.error(f"Не удалось отправить сводку: {e}")
-        # Сбросить сессию
+        # Сбросить сессию смены, сохранить профиль
         user = ctx.user_data.get("user") or get_user(tid)
         ctx.user_data.clear()
         if user:
             ctx.user_data["user"] = user
+        chat_id = q.message.chat_id
         await q.get_bot().send_message(
-            update.effective_chat.id if hasattr(q, '_effective_chat') else q.message.chat_id,
+            chat_id,
             "Хотите начать новую смену?",
             reply_markup=kb([("🚀 Новая смена", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
         )
@@ -760,7 +750,7 @@ async def _handle(q, ctx, data: str, tid: int):
 
     logger.warning(f"[cb] необработанный data={data!r}")
 
-# ─── Запуск ───────────────────────────────────────────────────────────────────
+# ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
     sync_users_from_sheets()
