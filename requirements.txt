@@ -1,4 +1,4 @@
-# v3 webhooks
+# v4 cache-bust-2
 python-telegram-bot[webhooks]==21.0
 gspread==6.1.2
 google-auth==2.29.0
