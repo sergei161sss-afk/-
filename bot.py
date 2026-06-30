@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Сансара — бот учёта смен v5.0
-Новое в v5.0:
-- Уведомление админу при открытии смены (🟢) и закрытии (🔴)
-- Автоотчёт каждый день в 21:00 МСК (JobQueue)
-- Контроль опозданий: проверка в 11:00 МСК
-- /salary [MM.YYYY] — итоги начислений за месяц по каждому сотруднику
-- /stats [MM.YYYY] — статистика по процедурам (топ по выручке)
-- Fallback на Google Sheets если users.json потерян при рестарте
+Сансара — бот учёта смен v5.1
+Новое в v5.1:
+- Расписание в Google Sheets: лист «Расписание» (Имя|Роль|Филиал|Пн..Вс)
+- Контроль опозданий по расписанию (только м1, м2, техпер), проверка каждые 30 мин
+- /schedule — статус расписания на сегодня
 """
 import os, json, logging, datetime
 import pytz
@@ -28,11 +25,15 @@ USERS_FILE     = "users.json"
 MSK            = datetime.timezone(datetime.timedelta(hours=3))
 MSK_TZ         = pytz.timezone("Europe/Moscow")
 ROLE_CODES     = {"м1", "мв", "м2", "техпер", "менеджер"}
+SCHEDULE_ROLES = {"м1", "м2", "техпер"}   # только эти роли контролируются по расписанию
+DAY_COLS       = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 # Активные смены: tid -> {name, role, branch, start_time, date}
 ACTIVE_SHIFTS: dict = {}
-# Кто уже завершил смену сегодня: date_str -> set(tid)
-TODAY_WORKED: dict = {}
+# Кто завершил смену сегодня: date_str -> set(name)
+TODAY_WORKED_NAMES: dict = {}
+# Кому уже отправили алерт об опоздании: date_str -> set(name)
+LATE_ALERTS: dict = {}
 
 def now_msk() -> datetime.datetime:
     return datetime.datetime.now(MSK)
@@ -61,6 +62,52 @@ def _users_ws(sh):
         ws.update([["telegram_id", "name", "role"]], "A1:C1")
         return ws
     return sh.worksheet("Пользователи")
+
+def ensure_schedule_ws(sh):
+    """Создаёт лист «Расписание» если его нет, с примером."""
+    titles = [w.title for w in sh.worksheets()]
+    if "Расписание" not in titles:
+        ws = sh.add_worksheet("Расписание", rows=50, cols=10)
+        ws.update([["Имя", "Роль", "Филиал", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]], "A1")
+        # Пример строки
+        ws.append_row(["Сергей", "м1", "Ирий", "10:00", "10:00", "", "10:00", "10:00", "", ""])
+        logger.info("Создан лист «Расписание»")
+    return sh.worksheet("Расписание")
+
+def get_schedule_today(sh) -> list:
+    """
+    Читает лист «Расписание» и возвращает список сотрудников на сегодня:
+    [{name, role, branch, time}]
+    Только роли из SCHEDULE_ROLES.
+    """
+    try:
+        ws = ensure_schedule_ws(sh)
+        rows = ws.get_all_values()
+        if not rows:
+            return []
+        headers = rows[0]
+        today_wd = now_msk().weekday()          # 0=Пн … 6=Вс
+        day_name = DAY_COLS[today_wd]
+        if day_name not in headers:
+            return []
+        day_idx = headers.index(day_name)
+        result = []
+        for row in rows[1:]:
+            if not any(row):
+                continue
+            if len(row) <= day_idx:
+                continue
+            name        = row[0].strip()
+            role        = row[1].strip()
+            branch      = row[2].strip() if len(row) > 2 else ""
+            shift_time  = row[day_idx].strip()
+            if not name or not shift_time or role not in SCHEDULE_ROLES:
+                continue
+            result.append({"name": name, "role": role, "branch": branch, "time": shift_time})
+        return result
+    except Exception as e:
+        logger.error(f"get_schedule_today: {e}")
+        return []
 
 # ── Хранение пользователей ────────────────────────────────────────────────────
 
@@ -105,11 +152,9 @@ def sync_users_from_sheets():
         logger.error(f"sync_users_from_sheets: {e}")
 
 def get_user(tid: int) -> dict | None:
-    """Читает пользователя локально, при отсутствии — из Sheets (резервное копирование)."""
     local = _load_local()
     if str(tid) in local:
         return local[str(tid)]
-    # Fallback: Sheets
     try:
         sh = _open_sheet()
         if sh is None:
@@ -147,10 +192,6 @@ def set_user(tid: int, data: dict):
         logger.error(f"set_user sheets sync: {e}")
 
 def write_shift(s: dict):
-    """
-    Журнал v4.2+:
-    date|name|tg_id|role|branch|start_time|end_time|type|pos|qty|price|amount|period|day|month|year
-    """
     try:
         sh = _open_sheet()
         if sh is None:
@@ -187,17 +228,9 @@ def write_shift(s: dict):
         logger.error(f"write_shift: {e}")
 
 def _parse_row(row: list) -> dict | None:
-    """
-    Разбирает строку Журнала в любом из трёх форматов:
-      v1 (старый): date|name|role|branch|type|pos|qty|price|...
-      v2 (v4.1):   date|name|role|branch|start|end|type|pos|qty|price|...
-      v3 (v4.2+):  date|name|tg_id|role|branch|start|end|type|pos|qty|price|amount|...
-    """
     if len(row) < 8:
         return None
-
     name = row[1]
-
     if row[2] in ROLE_CODES:
         tg_id  = ""
         role   = row[2]
@@ -220,13 +253,11 @@ def _parse_row(row: list) -> dict | None:
         rtype  = row[7] if len(row) > 7 else ""
         pos    = row[8] if len(row) > 8 else ""
         qi, pi = 9, 10
-
     try:
         qty   = float(str(row[qi]).replace(",", "."))
         price = float(str(row[pi]).replace(",", "."))
     except (ValueError, IndexError):
         return None
-
     return dict(name=name, tg_id=tg_id, role=role, branch=branch,
                 start=start, end=end, rtype=rtype, pos=pos,
                 qty=qty, price=price, amount=qty * price)
@@ -240,7 +271,6 @@ def get_report(date_str: str) -> str:
         all_rows = ws.get_all_values()
         if not all_rows:
             return f"📭 Нет данных за {date_str}."
-
         employees: dict = {}
         for row in all_rows:
             if not row or row[0] != date_str:
@@ -258,13 +288,10 @@ def get_report(date_str: str) -> str:
                 }
             bucket = "ставки" if p["rtype"] == "ставка" else "процедуры"
             employees[key][bucket][p["pos"]] = (p["qty"], p["price"])
-
         if not employees:
             return f"📭 Нет данных за {date_str}."
-
         lines = [f"📊 Отчёт за {date_str}", ""]
         grand_total = 0.0
-
         for e in employees.values():
             role_short = ROLE_SHORT.get(e["role"], e["role"])
             id_str     = f" [ID: {e['tg_id']}]" if e["tg_id"] else ""
@@ -272,7 +299,6 @@ def get_report(date_str: str) -> str:
             lines.append(f"👤 {e['name']}{id_str} ({role_short}) | {e['branch']}")
             lines.append(time_str)
             emp_total = 0.0
-
             if e["ставки"]:
                 lines.append("  Ставки:")
                 for pos, (qty, price) in e["ставки"].items():
@@ -280,7 +306,6 @@ def get_report(date_str: str) -> str:
                     emp_total += amt
                     q = str(int(qty)) if qty == int(qty) else str(qty)
                     lines.append(f"    {pos}: {q} × {int(price)} = {int(amt)} руб")
-
             if e["процедуры"]:
                 lines.append("  Процедуры:")
                 for pos, (qty, price) in e["процедуры"].items():
@@ -288,15 +313,12 @@ def get_report(date_str: str) -> str:
                     emp_total += amt
                     q = str(int(qty)) if qty == int(qty) else str(qty)
                     lines.append(f"    {pos}: {q} × {int(price)} = {int(amt)} руб")
-
             lines.append(f"  💰 Итого: {int(emp_total)} руб")
             lines.append("")
             grand_total += emp_total
-
         lines.append("─" * 30)
         lines.append(f"💵 ОБЩАЯ СУММА: {int(grand_total)} руб")
         return "\n".join(lines)
-
     except Exception as e:
         logger.error(f"get_report: {e}")
         return f"❌ Ошибка: {e}"
@@ -530,7 +552,7 @@ def _item_buttons(items, prefix, s):
 # ── Запланированные задачи (JobQueue) ─────────────────────────────────────────
 
 async def daily_report_job(context):
-    """Автоотчёт каждый день в 21:00 МСК."""
+    """Автоотчёт каждый день в 23:55 МСК."""
     if not ADMIN_CHAT_ID:
         return
     date_str = now_msk().strftime("%d.%m.%Y")
@@ -544,41 +566,87 @@ async def daily_report_job(context):
         logger.error(f"daily_report_job: {e}")
 
 async def late_check_job(context):
-    """Проверка в 11:00 МСК — если никто не открыл смену, предупредить."""
+    """
+    Проверка опозданий по расписанию каждые 30 мин (9:00–18:00 МСК).
+    Контролируются только м1, м2, техпер.
+    Алерт отправляется однократно на каждого опоздавшего.
+    """
     if not ADMIN_CHAT_ID:
         return
-    today = now_msk().strftime("%d.%m.%Y")
-    active_today  = {tid for tid, v in ACTIVE_SHIFTS.items() if v.get("date") == today}
-    worked_today  = TODAY_WORKED.get(today, set())
-    if not active_today and not worked_today:
-        try:
-            await context.bot.send_message(
-                ADMIN_CHAT_ID,
-                f"⚠️ 11:00 МСК — сегодня ({today}) ещё никто не открыл смену!"
-            )
-        except Exception as e:
-            logger.error(f"late_check_job: {e}")
+    now = now_msk()
+    # Работаем только в рабочие часы
+    if not (9 <= now.hour < 18):
+        return
+
+    today = now.strftime("%d.%m.%Y")
+    try:
+        sh = _open_sheet()
+        if sh is None:
+            return
+        scheduled = get_schedule_today(sh)
+        if not scheduled:
+            return
+
+        active_names = {v["name"] for v in ACTIVE_SHIFTS.values() if v.get("date") == today}
+        worked_names = TODAY_WORKED_NAMES.get(today, set())
+        alerted      = LATE_ALERTS.get(today, set())
+
+        late_people = []
+        for entry in scheduled:
+            name = entry["name"]
+            # Уже алертили, или уже на смене, или уже отработал
+            if name in alerted or name in active_names or name in worked_names:
+                continue
+            # Проверяем: плановое время + 30 мин уже прошло?
+            try:
+                sch_h, sch_m = map(int, entry["time"].split(":"))
+                # Grace period 30 минут
+                total_min = sch_h * 60 + sch_m + 30
+                grace_h, grace_m = divmod(total_min, 60)
+                if (now.hour, now.minute) >= (grace_h % 24, grace_m):
+                    late_people.append(entry)
+            except Exception:
+                continue
+
+        if not late_people:
+            return
+
+        # Записываем что алерт отправлен
+        if today not in LATE_ALERTS:
+            LATE_ALERTS[today] = set()
+        for entry in late_people:
+            LATE_ALERTS[today].add(entry["name"])
+
+        lines = [f"⚠️ Не вышли на смену ({today}):"]
+        for entry in late_people:
+            role_s = ROLE_SHORT.get(entry["role"], entry["role"])
+            branch_s = f" | {entry['branch']}" if entry["branch"] else ""
+            lines.append(f"  👤 {entry['name']} ({role_s}){branch_s} — план {entry['time']}")
+
+        await context.bot.send_message(ADMIN_CHAT_ID, "\n".join(lines))
+
+    except Exception as e:
+        logger.error(f"late_check_job: {e}")
 
 async def post_init(application: Application) -> None:
-    """Регистрируем плановые задачи после инициализации приложения."""
     jq = application.job_queue
     if jq is None:
-        logger.warning("JobQueue недоступен — задачи по расписанию не зарегистрированы. "
-                       "Установите: python-telegram-bot[job-queue]")
+        logger.warning("JobQueue недоступен. Установите python-telegram-bot[job-queue]")
         return
-    # Ежедневный отчёт в 21:00 МСК
+    # Автоотчёт в 23:55 МСК
     jq.run_daily(
         daily_report_job,
         time=datetime.time(23, 55, 0, tzinfo=MSK_TZ),
         name="daily_report",
     )
-    # Проверка опозданий в 11:00 МСК
-    jq.run_daily(
+    # Контроль опозданий каждые 30 мин (реальная проверка только 9:00–18:00)
+    jq.run_repeating(
         late_check_job,
-        time=datetime.time(11, 0, 0, tzinfo=MSK_TZ),
+        interval=1800,   # 30 минут
+        first=60,        # первый запуск через 1 мин после старта
         name="late_check",
     )
-    logger.info("Задачи по расписанию зарегистрированы: отчёт в 21:00, проверка в 11:00 МСК")
+    logger.info("Задачи по расписанию зарегистрированы")
 
 # ── Команды ───────────────────────────────────────────────────────────────────
 
@@ -634,10 +702,7 @@ async def cmd_report(update, ctx):
         await update.message.reply_text(report[i:i+4000])
 
 async def cmd_salary(update, ctx):
-    """
-    /salary [MM.YYYY] — начисления за месяц по каждому сотруднику.
-    По умолчанию — текущий месяц.
-    """
+    """/salary [MM.YYYY] — начисления за месяц по каждому сотруднику."""
     tid = update.effective_user.id
     if ADMIN_CHAT_ID and tid != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Команда доступна только администратору.")
@@ -653,10 +718,8 @@ async def cmd_salary(update, ctx):
             return
     else:
         month, year = now.month, now.year
-
     label = f"{month:02d}.{year}"
     await update.message.reply_text(f"⏳ Формирую зарплатный отчёт за {label}...")
-
     try:
         sh = _open_sheet()
         if sh is None:
@@ -664,8 +727,7 @@ async def cmd_salary(update, ctx):
             return
         ws = sh.worksheet("Журнал")
         all_rows = ws.get_all_values()
-
-        totals: dict = {}  # name -> {role, total, ставки, процедуры, shifts}
+        totals: dict = {}
         for row in all_rows:
             if not row or row[0] == "Дата":
                 continue
@@ -688,40 +750,33 @@ async def cmd_salary(update, ctx):
             else:
                 totals[name]["процедуры"] += p["amount"]
             totals[name]["shifts"].add(row[0])
-
         if not totals:
             await update.message.reply_text(f"📭 Нет данных за {label}.")
             return
-
         lines = [f"💰 Начисления за {label}", ""]
         grand = 0.0
-        for name, d in sorted(totals.items(), key=lambda x: -x[1]["total"]):
-            role_s   = ROLE_SHORT.get(d["role"], d["role"])
-            n_shifts = len(d["shifts"])
+        for name, info in sorted(totals.items(), key=lambda x: -x[1]["total"]):
+            role_s   = ROLE_SHORT.get(info["role"], info["role"])
+            n_shifts = len(info["shifts"])
             lines.append(f"👤 {name} ({role_s}) — {n_shifts} смен")
-            if d["ставки"]:
-                lines.append(f"   Ставки:    {int(d['ставки'])} руб")
-            if d["процедуры"]:
-                lines.append(f"   Процедуры: {int(d['процедуры'])} руб")
-            lines.append(f"   💰 Итого: {int(d['total'])} руб")
+            if info["ставки"]:
+                lines.append(f"   Ставки:    {int(info['ставки'])} руб")
+            if info["процедуры"]:
+                lines.append(f"   Процедуры: {int(info['процедуры'])} руб")
+            lines.append(f"   💰 Итого: {int(info['total'])} руб")
             lines.append("")
-            grand += d["total"]
+            grand += info["total"]
         lines.append("─" * 30)
         lines.append(f"💵 ВСЕГО К ВЫПЛАТЕ: {int(grand)} руб")
-
         text = "\n".join(lines)
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
-
     except Exception as e:
-        logger.error(f"cmd_salary: {e}")
+        logger.error(f"cmd_salary: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_stats(update, ctx):
-    """
-    /stats [MM.YYYY] — статистика по процедурам и ставкам.
-    По умолчанию — текущий месяц.
-    """
+    """/stats [MM.YYYY] — статистика по процедурам и ставкам."""
     tid = update.effective_user.id
     if ADMIN_CHAT_ID and tid != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Команда доступна только администратору.")
@@ -737,10 +792,8 @@ async def cmd_stats(update, ctx):
             return
     else:
         month, year = now.month, now.year
-
     label = f"{month:02d}.{year}"
     await update.message.reply_text(f"⏳ Формирую статистику за {label}...")
-
     try:
         sh = _open_sheet()
         if sh is None:
@@ -748,10 +801,8 @@ async def cmd_stats(update, ctx):
             return
         ws = sh.worksheet("Журнал")
         all_rows = ws.get_all_values()
-
-        procs: dict = {}  # pos -> {qty, revenue}
-        rates: dict = {}  # pos -> {qty, revenue}
-
+        procs: dict = {}
+        rates: dict = {}
         for row in all_rows:
             if not row or row[0] == "Дата":
                 continue
@@ -770,34 +821,69 @@ async def cmd_stats(update, ctx):
                 bucket[pos] = {"qty": 0.0, "revenue": 0.0}
             bucket[pos]["qty"]     += p["qty"]
             bucket[pos]["revenue"] += p["amount"]
-
         if not procs and not rates:
             await update.message.reply_text(f"📭 Нет данных за {label}.")
             return
-
         lines = [f"📈 Статистика за {label}", ""]
-
         if procs:
             total_proc_rev = sum(v["revenue"] for v in procs.values())
             lines.append(f"🔥 Процедуры — выручка: {int(total_proc_rev)} руб")
             for pos, d in sorted(procs.items(), key=lambda x: -x[1]["revenue"]):
-                q = _qty_str(d["qty"])
-                lines.append(f"  {pos}: {q} шт → {int(d['revenue'])} руб")
+                lines.append(f"  {pos}: {_qty_str(d['qty'])} шт → {int(d['revenue'])} руб")
             lines.append("")
-
         if rates:
             total_rate_rev = sum(v["revenue"] for v in rates.values())
             lines.append(f"⚡ Ставки — выплаты: {int(total_rate_rev)} руб")
             for pos, d in sorted(rates.items(), key=lambda x: -x[1]["revenue"]):
-                q = _qty_str(d["qty"])
-                lines.append(f"  {pos}: {q} шт → {int(d['revenue'])} руб")
-
+                lines.append(f"  {pos}: {_qty_str(d['qty'])} шт → {int(d['revenue'])} руб")
         text = "\n".join(lines)
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
-
     except Exception as e:
-        logger.error(f"cmd_stats: {e}")
+        logger.error(f"cmd_stats: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+async def cmd_schedule(update, ctx):
+    """/schedule — статус расписания на сегодня."""
+    tid = update.effective_user.id
+    if ADMIN_CHAT_ID and tid != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Команда доступна только администратору.")
+        return
+    try:
+        sh = _open_sheet()
+        if sh is None:
+            await update.message.reply_text("❌ Google Sheets не подключены.")
+            return
+        scheduled = get_schedule_today(sh)
+        today = now_msk().strftime("%d.%m.%Y")
+        wd_name = DAY_COLS[now_msk().weekday()]
+        if not scheduled:
+            await update.message.reply_text(
+                f"📅 Расписание на сегодня ({today}, {wd_name}) пусто.\n\n"
+                f"Заполни лист «Расписание» в Google Sheets:\n"
+                f"Имя | Роль | Филиал | Пн | Вт | Ср | Чт | Пт | Сб | Вс\n"
+                f"(время выхода в формате ЧЧ:ММ)"
+            )
+            return
+        active_names = {v["name"] for v in ACTIVE_SHIFTS.values() if v.get("date") == today}
+        worked_names = TODAY_WORKED_NAMES.get(today, set())
+        alerted      = LATE_ALERTS.get(today, set())
+        lines = [f"📅 Расписание на {today} ({wd_name}):"]
+        for e in scheduled:
+            role_s = ROLE_SHORT.get(e["role"], e["role"])
+            branch_s = f" | {e['branch']}" if e["branch"] else ""
+            if e["name"] in active_names:
+                status = "🟢 на смене"
+            elif e["name"] in worked_names:
+                status = "✅ отработал"
+            elif e["name"] in alerted:
+                status = f"🔴 опоздал (план {e['time']})"
+            else:
+                status = f"⏰ план {e['time']}"
+            lines.append(f"  {e['name']} ({role_s}){branch_s} — {status}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"cmd_schedule: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 # ── Единый обработчик кнопок ──────────────────────────────────────────────────
@@ -918,7 +1004,6 @@ async def _handle(q, ctx, data: str, tid: int):
         s = new_session(user, tid)
         s["branch"] = branch
         ctx.user_data["s"] = s
-        # Трекинг активных смен
         ACTIVE_SHIFTS[tid] = {
             "name": user["name"], "role": user["role"],
             "branch": branch, "start_time": s["start_time"], "date": s["date"],
@@ -928,7 +1013,6 @@ async def _handle(q, ctx, data: str, tid: int):
             f"📅 {s['date']} {s['start_time']} МСК",
             reply_markup=main_kb(user["role"]),
         )
-        # Уведомление админу
         if ADMIN_CHAT_ID:
             try:
                 role_s = ROLE_SHORT.get(user["role"], user["role"])
@@ -1074,19 +1158,16 @@ async def _handle(q, ctx, data: str, tid: int):
         summary = fmt(s, final=True) + f"\n⏱ Конец: {s['end_time']} МСК"
         await q.edit_message_text(summary + "\n\n✅ Смена закрыта. Спасибо!")
         write_shift(s)
-        # Убираем из активных смен, добавляем в "работал сегодня"
         ACTIVE_SHIFTS.pop(tid, None)
         today = s.get("date", now_msk().strftime("%d.%m.%Y"))
-        if today not in TODAY_WORKED:
-            TODAY_WORKED[today] = set()
-        TODAY_WORKED[today].add(tid)
-        # Уведомление админу о закрытии
+        wname = s.get("name", "")
+        if wname:
+            if today not in TODAY_WORKED_NAMES:
+                TODAY_WORKED_NAMES[today] = set()
+            TODAY_WORKED_NAMES[today].add(wname)
         if ADMIN_CHAT_ID:
             try:
-                await q.get_bot().send_message(
-                    ADMIN_CHAT_ID,
-                    f"🔴 Смена закрыта\n\n{summary}",
-                )
+                await q.get_bot().send_message(ADMIN_CHAT_ID, f"🔴 Смена закрыта\n\n{summary}")
             except Exception as e:
                 logger.error(f"Уведомление о закрытии смены: {e}")
         user = ctx.user_data.get("user") or get_user(tid)
@@ -1111,12 +1192,13 @@ def main():
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("myid",    cmd_myid))
-    app.add_handler(CommandHandler("report",  cmd_report))
-    app.add_handler(CommandHandler("salary",  cmd_salary))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("reset",    cmd_reset))
+    app.add_handler(CommandHandler("myid",     cmd_myid))
+    app.add_handler(CommandHandler("report",   cmd_report))
+    app.add_handler(CommandHandler("salary",   cmd_salary))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     async def err_handler(update, ctx):
@@ -1125,7 +1207,7 @@ def main():
 
     webhook_url = os.getenv("WEBHOOK_URL", "")
     port = int(os.getenv("PORT", "8080"))
-    logger.info("Бот Сансара v5.0 запускается...")
+    logger.info("Бот Сансара v5.1 запускается...")
     if webhook_url:
         full_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
         logger.info(f"Webhook URL: {full_url}")
