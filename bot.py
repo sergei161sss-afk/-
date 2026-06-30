@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Сансара — бот учёта смен v4.1
-- /report [дата] — отчёт администратора
-- Время начала смены записывается в Журнал
+Сансара — бот учёта смен v4.2
+- /report [дата] — отчёт администратора с ID сотрудника
+- Время по Москве (UTC+3)
+- Ставка М-В = 400
 """
 import os, json, logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -20,6 +21,10 @@ SPREADSHEET_ID = "1YLGV-Lprd5HZ7wwph728zPgISaVjPflhjlleZbV2Sco"
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0")) or None
 USERS_FILE     = "users.json"
+MSK            = timezone(timedelta(hours=3))
+
+def now_msk() -> datetime:
+    return datetime.now(MSK)
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
@@ -111,7 +116,7 @@ def set_user(tid: int, data: dict):
 def write_shift(s: dict):
     """
     Журнал колонки:
-    date | name | role | branch | start_time | end_time | type | position | qty | price | amount | period | day | month | year
+    date | name | telegram_id | role | branch | start_time | end_time | type | position | qty | price | amount | period | day | month | year
     """
     try:
         sh = _open_sheet()
@@ -119,25 +124,26 @@ def write_shift(s: dict):
             logger.warning("Google Sheets не подключены.")
             return
         ws = sh.worksheet("Журнал")
-        date_str = s["date"]
-        parts = date_str.split(".")
+        date_str   = s["date"]
+        parts      = date_str.split(".")
         day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-        period = "1-15" if day <= 15 else "16-31"
+        period     = "1-15" if day <= 15 else "16-31"
         start_time = s.get("start_time", "")
-        end_time = s.get("end_time", "")
-        cat = CATALOGUE.get(s["role"], {}).get(s["branch"], {})
-        rows = []
+        end_time   = s.get("end_time", "")
+        tg_id      = str(s.get("tid", ""))
+        cat        = CATALOGUE.get(s["role"], {}).get(s["branch"], {})
+        rows       = []
         rates_dict = dict(cat.get("ставки", []))
         for pos, qty in s.get("ставки", {}).items():
             price = rates_dict.get(pos, 0)
-            rows.append([date_str, s["name"], s["role"], s["branch"],
+            rows.append([date_str, s["name"], tg_id, s["role"], s["branch"],
                          start_time, end_time, "ставка",
                          pos, qty, price, round(price * qty, 2),
                          period, day, month, year])
         procs_dict = dict(cat.get("процедуры", []))
         for pos, qty in s.get("процедуры", {}).items():
             price = procs_dict.get(pos, 0)
-            rows.append([date_str, s["name"], s["role"], s["branch"],
+            rows.append([date_str, s["name"], tg_id, s["role"], s["branch"],
                          start_time, end_time, "процедура",
                          pos, qty, price, round(price * qty, 2),
                          period, day, month, year])
@@ -158,30 +164,29 @@ def get_report(date_str: str) -> str:
         if not rows:
             return f"📭 Нет данных за {date_str}."
 
-        # Группируем по (name, role, branch, start_time)
-        employees = {}  # key -> {info, ставки: {pos: (qty,price)}, процедуры: {pos: (qty,price)}}
+        # Колонки: date|name|tg_id|role|branch|start|end|type|pos|qty|price|amount|...
+        employees = {}
         for row in rows:
-            if len(row) < 11:
-                continue
-            if row[0] != date_str:
+            if len(row) < 10 or row[0] != date_str:
                 continue
             name       = row[1]
-            role       = row[2]
-            branch     = row[3]
-            start_time = row[4] if len(row) > 4 else ""
-            end_time   = row[5] if len(row) > 5 else ""
-            rtype      = row[6] if len(row) > 6 else row[4]  # обратная совместимость
-            pos        = row[7] if len(row) > 7 else row[5]
+            tg_id      = row[2] if len(row) > 2 else ""
+            role       = row[3] if len(row) > 3 else ""
+            branch     = row[4] if len(row) > 4 else ""
+            start_time = row[5] if len(row) > 5 else ""
+            end_time   = row[6] if len(row) > 6 else ""
+            rtype      = row[7] if len(row) > 7 else ""
+            pos        = row[8] if len(row) > 8 else ""
             try:
-                qty   = float(str(row[8] if len(row) > 8 else row[6]).replace(",", "."))
-                price = float(str(row[9] if len(row) > 9 else row[7]).replace(",", "."))
+                qty   = float(str(row[9]).replace(",", "."))
+                price = float(str(row[10]).replace(",", "."))
             except (ValueError, IndexError):
                 continue
 
             key = (name, role, branch, start_time)
             if key not in employees:
                 employees[key] = {
-                    "name": name, "role": role, "branch": branch,
+                    "name": name, "tg_id": tg_id, "role": role, "branch": branch,
                     "start": start_time, "end": end_time,
                     "ставки": {}, "процедуры": {},
                 }
@@ -196,8 +201,9 @@ def get_report(date_str: str) -> str:
 
         for key, e in employees.items():
             role_short = ROLE_SHORT.get(e["role"], e["role"])
+            id_str = f" [ID: {e['tg_id']}]" if e["tg_id"] else ""
             time_str = f"⏰ {e['start']}" + (f" – {e['end']}" if e["end"] else "")
-            lines.append(f"👤 {e['name']} ({role_short}) | {e['branch']}")
+            lines.append(f"👤 {e['name']}{id_str} ({role_short}) | {e['branch']}")
             lines.append(time_str)
             emp_total = 0.0
 
@@ -227,7 +233,7 @@ def get_report(date_str: str) -> str:
 
     except Exception as e:
         logger.error(f"get_report: {e}")
-        return f"❌ Ошибка при получении отчёта: {e}"
+        return f"❌ Ошибка: {e}"
 
 # ── Данные ────────────────────────────────────────────────────────────────────
 
@@ -289,7 +295,7 @@ CATALOGUE = {
     "мв": {
         "Ирий": {
             "ставки": [
-                ("Ставка за выход М-В", 1500), ("Чан 1-й", 450),
+                ("Ставка за выход М-В", 400), ("Чан 1-й", 450),
                 ("Чан 2-й", 300), ("Чан 3-й", 300),
             ],
             "процедуры": [
@@ -305,7 +311,7 @@ CATALOGUE = {
         },
         "Правь": {
             "ставки": [
-                ("Ставка за выход М-В", 1500), ("Чан 1-й", 450), ("Чан 2-й", 300),
+                ("Ставка за выход М-В", 400), ("Чан 1-й", 450), ("Чан 2-й", 300),
             ],
             "процедуры": [
                 ("Арома Медитация", 150), ("Колл Пар", 210),
@@ -384,14 +390,9 @@ def kb(buttons: list, cols: int = 2) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(t, callback_data=d) for t, d in buttons[i:i+cols]])
     return InlineKeyboardMarkup(rows)
 
-def names_kb() -> InlineKeyboardMarkup:
-    return kb([(n, f"rn_{n}") for n in ALL_NAMES], cols=3)
-
-def roles_kb() -> InlineKeyboardMarkup:
-    return kb([(v, f"rr_{k}") for k, v in ROLE_LABELS.items()], cols=1)
-
-def branch_kb() -> InlineKeyboardMarkup:
-    return kb([("🏠 Ирий", "br_Ирий"), ("🏠 Правь", "br_Правь")])
+def names_kb():   return kb([(n, f"rn_{n}") for n in ALL_NAMES], cols=3)
+def roles_kb():   return kb([(v, f"rr_{k}") for k, v in ROLE_LABELS.items()], cols=1)
+def branch_kb():  return kb([("🏠 Ирий", "br_Ирий"), ("🏠 Правь", "br_Правь")])
 
 def main_kb(role: str) -> InlineKeyboardMarkup:
     btns = [("➕ Ставки / подготовка", "add_rate")]
@@ -400,18 +401,16 @@ def main_kb(role: str) -> InlineKeyboardMarkup:
     btns += [("📊 Мой итог", "show"), ("👤 Профиль", "profile"), ("🔒 Закрыть смену", "close")]
     return kb(btns, cols=2)
 
-def profile_kb() -> InlineKeyboardMarkup:
-    return kb([
-        ("🔄 Сменить роль", "change_role"),
-        ("✏️ Сменить имя", "change_name"),
-        ("🚀 Начать смену", "start_shift"),
-    ], cols=1)
+def profile_kb():
+    return kb([("🔄 Сменить роль", "change_role"), ("✏️ Сменить имя", "change_name"), ("🚀 Начать смену", "start_shift")], cols=1)
 
-def new_session(user: dict) -> dict:
+def new_session(user: dict, tid: int) -> dict:
+    now = now_msk()
     return {
         "role": user["role"], "name": user["name"], "branch": None,
-        "date": datetime.now().strftime("%d.%m.%Y"),
-        "start_time": datetime.now().strftime("%H:%M"),
+        "tid": tid,
+        "date": now.strftime("%d.%m.%Y"),
+        "start_time": now.strftime("%H:%M"),
         "ставки": {}, "процедуры": {},
     }
 
@@ -457,8 +456,8 @@ def _item_buttons(items, prefix, s):
     for i, (name, price) in enumerate(items):
         qty = bucket.get(name, 0)
         mark = "✅ " if qty else ""
-        qty_str = f" [{_qty_str(qty)}]" if qty else ""
-        btns.append((f"{mark}{name} +{price}{qty_str}", f"{prefix}_{i}"))
+        qs = f" [{_qty_str(qty)}]" if qty else ""
+        btns.append((f"{mark}{name} +{price}{qs}", f"{prefix}_{i}"))
     return btns
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -470,19 +469,14 @@ async def cmd_start(update, ctx):
     if user:
         ctx.user_data["user"] = user
         await update.message.reply_text(
-            f"👋 С возвращением, {user['name']}!\n"
-            f"Роль: {ROLE_LABELS.get(user['role'], user['role'])}",
+            f"👋 С возвращением, {user['name']}!\nРоль: {ROLE_LABELS.get(user['role'], user['role'])}",
             reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Мой профиль", "go_profile")], cols=1),
         )
     else:
-        await update.message.reply_text(
-            "👋 Добро пожаловать в бот Сансара!\n\nВыберите своё имя:",
-            reply_markup=names_kb(),
-        )
+        await update.message.reply_text("👋 Добро пожаловать!\n\nВыберите своё имя:", reply_markup=names_kb())
 
 async def cmd_reset(update, ctx):
     tid = update.effective_user.id
-    logger.info(f"[/reset] user={tid}")
     users = _load_local()
     users.pop(str(tid), None)
     _save_local(users)
@@ -498,37 +492,24 @@ async def cmd_reset(update, ctx):
     except Exception as e:
         logger.error(f"cmd_reset sheets: {e}")
     ctx.user_data.clear()
-    await update.message.reply_text(
-        "🔄 Профиль сброшен.\n\nВыберите своё имя:", reply_markup=names_kb()
-    )
+    await update.message.reply_text("🔄 Профиль сброшен.\n\nВыберите своё имя:", reply_markup=names_kb())
 
 async def cmd_myid(update, ctx):
     cid = update.effective_chat.id
     await update.message.reply_text(
-        f"Ваш Chat ID: `{cid}`\n\nДобавьте переменную `ADMIN_CHAT_ID` в Railway Variables.",
+        f"Ваш Chat ID: `{cid}`\n\nДобавьте `ADMIN_CHAT_ID` в Railway Variables.",
         parse_mode="Markdown",
     )
 
 async def cmd_report(update, ctx):
-    """
-    /report          — отчёт за сегодня
-    /report 30.06.2026 — отчёт за указанную дату
-    """
     tid = update.effective_user.id
-    # Проверка доступа: только администратор
     if ADMIN_CHAT_ID and tid != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Команда доступна только администратору.")
         return
-
     args = ctx.args
-    if args:
-        date_str = args[0]
-    else:
-        date_str = datetime.now().strftime("%d.%m.%Y")
-
+    date_str = args[0] if args else now_msk().strftime("%d.%m.%Y")
     await update.message.reply_text(f"⏳ Формирую отчёт за {date_str}...")
     report = get_report(date_str)
-    # Telegram ограничивает сообщения 4096 символами
     for i in range(0, len(report), 4000):
         await update.message.reply_text(report[i:i+4000])
 
@@ -545,10 +526,7 @@ async def on_callback(update, ctx):
     except Exception as e:
         logger.error(f"[cb ERROR] user={tid} data={data} err={e}", exc_info=True)
         try:
-            await q.edit_message_text(
-                "⚠️ Ошибка. Нажмите /start",
-                reply_markup=kb([("🔄 Начать заново", "restart")]),
-            )
+            await q.edit_message_text("⚠️ Ошибка. Нажмите /start", reply_markup=kb([("🔄 Начать заново", "restart")]))
         except Exception:
             pass
 
@@ -557,10 +535,7 @@ async def _handle(q, ctx, data: str, tid: int):
         user = get_user(tid)
         if user:
             ctx.user_data["user"] = user
-            await q.edit_message_text(
-                f"👋 {user['name']}! Выберите действие:",
-                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
-            )
+            await q.edit_message_text(f"👋 {user['name']}!", reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1))
         else:
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
         return
@@ -573,10 +548,7 @@ async def _handle(q, ctx, data: str, tid: int):
             user["name"] = name
             set_user(tid, user)
             ctx.user_data["user"] = user
-            await q.edit_message_text(
-                f"✅ Имя изменено: {name}\nРоль: {ROLE_LABELS.get(user.get('role', ''), '—')}",
-                reply_markup=profile_kb(),
-            )
+            await q.edit_message_text(f"✅ Имя изменено: {name}", reply_markup=profile_kb())
         else:
             ctx.user_data["reg_name"] = name
             await q.edit_message_text(f"👤 Имя: {name}\n\nВыберите роль:", reply_markup=roles_kb())
@@ -604,7 +576,7 @@ async def _handle(q, ctx, data: str, tid: int):
             ctx.user_data["user"] = user
             ctx.user_data.pop("reg_name", None)
             await q.edit_message_text(
-                f"✅ Профиль создан!\n👤 {name}\n🎭 {ROLE_LABELS[role]}\n\nВыберите действие:",
+                f"✅ Профиль создан!\n👤 {name}\n🎭 {ROLE_LABELS[role]}",
                 reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
             )
         return
@@ -616,7 +588,7 @@ async def _handle(q, ctx, data: str, tid: int):
             return
         ctx.user_data["user"] = user
         await q.edit_message_text(
-            f"👤 Профиль\n\nИмя: {user['name']}\nРоль: {ROLE_LABELS.get(user['role'], user['role'])}",
+            f"👤 {user['name']}\nРоль: {ROLE_LABELS.get(user['role'], user['role'])}",
             reply_markup=profile_kb(),
         )
         return
@@ -654,13 +626,11 @@ async def _handle(q, ctx, data: str, tid: int):
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
             return
         ctx.user_data["user"] = user
-        s = new_session(user)
+        s = new_session(user, tid)
         s["branch"] = branch
         ctx.user_data["s"] = s
         await q.edit_message_text(
-            f"✅ Смена открыта!\n"
-            f"👤 {user['name']} | {ROLE_SHORT.get(user['role'], '')} | {branch}\n"
-            f"📅 {s['date']} {s['start_time']}",
+            f"✅ Смена открыта!\n👤 {user['name']} | {ROLE_SHORT.get(user['role'], '')} | {branch}\n📅 {s['date']} {s['start_time']} МСК",
             reply_markup=main_kb(user["role"]),
         )
         return
@@ -679,18 +649,15 @@ async def _handle(q, ctx, data: str, tid: int):
         if not user:
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
             return
-        role_in_shift = s.get("role", user["role"])
         await q.edit_message_text(
-            f"👤 {user['name']}\nРоль: {ROLE_LABELS.get(role_in_shift, role_in_shift)}",
+            f"👤 {user['name']}\nРоль: {ROLE_LABELS.get(s.get('role', user['role']), '')}",
             reply_markup=kb([("🔄 Сменить роль в смене", "sr_shift"), ("◀️ Назад", "back_main")], cols=1),
         )
         return
 
     if data == "sr_shift":
-        await q.edit_message_text(
-            "Выберите новую роль для текущей смены:",
-            reply_markup=kb([(v, f"srs_{k}") for k, v in ROLE_LABELS.items()], cols=1),
-        )
+        await q.edit_message_text("Выберите роль для текущей смены:",
+            reply_markup=kb([(v, f"srs_{k}") for k, v in ROLE_LABELS.items()], cols=1))
         return
 
     if data.startswith("srs_"):
@@ -707,10 +674,8 @@ async def _handle(q, ctx, data: str, tid: int):
 
     if data == "back_main":
         if not s.get("branch"):
-            await q.edit_message_text(
-                "Выберите действие:",
-                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
-            )
+            await q.edit_message_text("Выберите действие:",
+                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1))
             return
         await q.edit_message_text(
             f"👤 {s.get('name', '')} | {s.get('branch', '')} | {s.get('date', '')}",
@@ -731,14 +696,11 @@ async def _handle(q, ctx, data: str, tid: int):
             return
         ctx.user_data["cur_items"] = items
         ctx.user_data["cur_prefix"] = prefix
-        btns = _item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")]
-        await q.edit_message_text(title, reply_markup=kb(btns, cols=1))
+        await q.edit_message_text(title, reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
         return
 
     if data.startswith("r_") or data.startswith("p_"):
-        parts = data.split("_", 1)
-        prefix = parts[0]
-        idx = int(parts[1])
+        prefix, idx = data.split("_", 1)[0], int(data.split("_", 1)[1])
         items = ctx.user_data.get("cur_items", [])
         if idx >= len(items):
             return
@@ -751,11 +713,7 @@ async def _handle(q, ctx, data: str, tid: int):
         cur_str = f" (сейчас: {_qty_str(cur_qty)})" if cur_qty else ""
         await q.edit_message_text(
             f"📌 {name} — {price} руб{cur_str}\n\nВыберите количество:",
-            reply_markup=kb([
-                ("+1", "qty_p1"), ("+0.5", "qty_p05"),
-                ("-1", "qty_m1"), ("-0.5", "qty_m05"),
-                ("◀️ К списку", "qty_back"),
-            ], cols=2),
+            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
         )
         return
 
@@ -764,8 +722,7 @@ async def _handle(q, ctx, data: str, tid: int):
             items = ctx.user_data.get("cur_items", [])
             prefix = ctx.user_data.get("cur_prefix", "r")
             title = "➕ Ставки / подготовка:" if prefix == "r" else "➕ Процедуры:"
-            btns = _item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")]
-            await q.edit_message_text(title, reply_markup=kb(btns, cols=1))
+            await q.edit_message_text(title, reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
             return
         name = ctx.user_data.get("cur_name", "")
         price = ctx.user_data.get("cur_price", 0)
@@ -774,21 +731,15 @@ async def _handle(q, ctx, data: str, tid: int):
             await q.edit_message_text("Назад", reply_markup=kb([("◀️ Назад", "back_main")]))
             return
         bucket = s.get("ставки", {}) if prefix == "r" else s.get("процедуры", {})
-        delta_map = {"qty_p1": 1.0, "qty_p05": 0.5, "qty_m1": -1.0, "qty_m05": -0.5}
-        delta = delta_map.get(data, 0)
+        delta = {"qty_p1": 1.0, "qty_p05": 0.5, "qty_m1": -1.0, "qty_m05": -0.5}.get(data, 0)
         new_qty = max(0.0, bucket.get(name, 0) + delta)
         if new_qty == 0:
             bucket.pop(name, None)
         else:
             bucket[name] = new_qty
-        amt = price * new_qty
         await q.edit_message_text(
-            f"📌 {name}\nКоличество: {_qty_str(new_qty)} → {int(amt)} руб\n\nВыберите количество:",
-            reply_markup=kb([
-                ("+1", "qty_p1"), ("+0.5", "qty_p05"),
-                ("-1", "qty_m1"), ("-0.5", "qty_m05"),
-                ("◀️ К списку", "qty_back"),
-            ], cols=2),
+            f"📌 {name}\nКоличество: {_qty_str(new_qty)} → {int(price * new_qty)} руб\n\nВыберите количество:",
+            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
         )
         return
 
@@ -808,23 +759,21 @@ async def _handle(q, ctx, data: str, tid: int):
         if not s.get("branch"):
             await q.edit_message_text("Смена не открыта.")
             return
-        end_time = datetime.now().strftime("%H:%M")
-        s["end_time"] = end_time
-        summary = fmt(s, final=True) + f"\n⏱ Конец: {end_time}"
+        s["end_time"] = now_msk().strftime("%H:%M")
+        summary = fmt(s, final=True) + f"\n⏱ Конец: {s['end_time']} МСК"
         await q.edit_message_text(summary + "\n\n✅ Смена закрыта. Спасибо!")
         write_shift(s)
         if ADMIN_CHAT_ID:
             try:
                 await q.get_bot().send_message(ADMIN_CHAT_ID, summary)
             except Exception as e:
-                logger.error(f"Не удалось отправить сводку: {e}")
+                logger.error(f"Сводка не отправлена: {e}")
         user = ctx.user_data.get("user") or get_user(tid)
         ctx.user_data.clear()
         if user:
             ctx.user_data["user"] = user
         await q.get_bot().send_message(
-            q.message.chat_id,
-            "Хотите начать новую смену?",
+            q.message.chat_id, "Хотите начать новую смену?",
             reply_markup=kb([("🚀 Новая смена", "start_shift"), ("👤 Профиль", "go_profile")], cols=1),
         )
         return
@@ -835,33 +784,24 @@ async def _handle(q, ctx, data: str, tid: int):
 
 def main():
     sync_users_from_sheets()
-
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(on_callback))
-
     async def err_handler(update, ctx):
         logger.error(f"[GLOBAL ERROR] {ctx.error}", exc_info=ctx.error)
     app.add_error_handler(err_handler)
-
     webhook_url = os.getenv("WEBHOOK_URL", "")
     port = int(os.getenv("PORT", "8080"))
-
-    logger.info("Бот Сансара v4.1 запускается...")
+    logger.info("Бот Сансара v4.2 запускается...")
     if webhook_url:
         full_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
         logger.info(f"Webhook URL: {full_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=TOKEN,
-            webhook_url=full_url,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
+        app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN,
+                        webhook_url=full_url, allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True)
     else:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
