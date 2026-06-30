@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Сансара — бот учёта смен v4.2
-- /report [дата] — отчёт администратора с ID сотрудника
+Сансара — бот учёта смен v4.3
+- /report [дата] — отчёт администратора
 - Время по Москве (UTC+3)
 - Ставка М-В = 400
+- Парсер Журнала поддерживает все форматы колонок
 """
 import os, json, logging
 from datetime import datetime, timezone, timedelta
@@ -22,6 +23,7 @@ SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0")) or None
 USERS_FILE     = "users.json"
 MSK            = timezone(timedelta(hours=3))
+ROLE_CODES     = {"м1", "мв", "м2", "техпер", "менеджер"}
 
 def now_msk() -> datetime:
     return datetime.now(MSK)
@@ -115,8 +117,8 @@ def set_user(tid: int, data: dict):
 
 def write_shift(s: dict):
     """
-    Журнал колонки:
-    date | name | telegram_id | role | branch | start_time | end_time | type | position | qty | price | amount | period | day | month | year
+    Журнал v4.2+:
+    date | name | tg_id | role | branch | start_time | end_time | type | pos | qty | price | amount | period | day | month | year
     """
     try:
         sh = _open_sheet()
@@ -153,45 +155,81 @@ def write_shift(s: dict):
     except Exception as e:
         logger.error(f"write_shift: {e}")
 
+def _parse_row(row: list) -> dict | None:
+    """
+    Разбирает строку Журнала в любом из трёх форматов:
+      v1 (старый): date|name|role|branch|type|pos|qty|price|amount|...
+      v2 (v4.1):   date|name|role|branch|start|end|type|pos|qty|price|amount|...
+      v3 (v4.2+):  date|name|tg_id|role|branch|start|end|type|pos|qty|price|amount|...
+    """
+    if len(row) < 8:
+        return None
+
+    name = row[1]
+
+    if row[2] in ROLE_CODES:
+        # v1 или v2 — нет tg_id
+        tg_id  = ""
+        role   = row[2]
+        branch = row[3]
+        if row[4] in ("ставка", "процедура"):
+            # v1: нет start/end
+            rtype = row[4]; pos = row[5]
+            qi, pi = 6, 7
+            start = end = ""
+        else:
+            # v2: есть start/end
+            start = row[4]; end = row[5] if len(row) > 5 else ""
+            rtype = row[6] if len(row) > 6 else ""
+            pos   = row[7] if len(row) > 7 else ""
+            qi, pi = 8, 9
+    else:
+        # v3: есть tg_id
+        tg_id  = row[2]
+        role   = row[3] if len(row) > 3 else ""
+        branch = row[4] if len(row) > 4 else ""
+        start  = row[5] if len(row) > 5 else ""
+        end    = row[6] if len(row) > 6 else ""
+        rtype  = row[7] if len(row) > 7 else ""
+        pos    = row[8] if len(row) > 8 else ""
+        qi, pi = 9, 10
+
+    try:
+        qty   = float(str(row[qi]).replace(",", "."))
+        price = float(str(row[pi]).replace(",", "."))
+    except (ValueError, IndexError):
+        return None
+
+    return dict(name=name, tg_id=tg_id, role=role, branch=branch,
+                start=start, end=end, rtype=rtype, pos=pos, qty=qty, price=price)
+
 def get_report(date_str: str) -> str:
-    """Читает Журнал и формирует отчёт за дату DD.MM.YYYY."""
     try:
         sh = _open_sheet()
         if sh is None:
             return "❌ Google Sheets не подключены."
         ws = sh.worksheet("Журнал")
-        rows = ws.get_all_values()
-        if not rows:
+        all_rows = ws.get_all_values()
+        if not all_rows:
             return f"📭 Нет данных за {date_str}."
 
-        # Колонки: date|name|tg_id|role|branch|start|end|type|pos|qty|price|amount|...
-        employees = {}
-        for row in rows:
-            if len(row) < 10 or row[0] != date_str:
+        employees: dict = {}
+        for row in all_rows:
+            if not row or row[0] != date_str:
                 continue
-            name       = row[1]
-            tg_id      = row[2] if len(row) > 2 else ""
-            role       = row[3] if len(row) > 3 else ""
-            branch     = row[4] if len(row) > 4 else ""
-            start_time = row[5] if len(row) > 5 else ""
-            end_time   = row[6] if len(row) > 6 else ""
-            rtype      = row[7] if len(row) > 7 else ""
-            pos        = row[8] if len(row) > 8 else ""
-            try:
-                qty   = float(str(row[9]).replace(",", "."))
-                price = float(str(row[10]).replace(",", "."))
-            except (ValueError, IndexError):
+            p = _parse_row(row)
+            if p is None:
                 continue
-
-            key = (name, role, branch, start_time)
+            key = (p["name"], p["role"], p["branch"], p["start"])
             if key not in employees:
                 employees[key] = {
-                    "name": name, "tg_id": tg_id, "role": role, "branch": branch,
-                    "start": start_time, "end": end_time,
+                    "name": p["name"], "tg_id": p["tg_id"],
+                    "role": p["role"], "branch": p["branch"],
+                    "start": p["start"], "end": p["end"],
                     "ставки": {}, "процедуры": {},
                 }
-            bucket = "ставки" if rtype == "ставка" else "процедуры"
-            employees[key][bucket][pos] = (qty, price)
+            bucket = "ставки" if p["rtype"] == "ставка" else "процедуры"
+            employees[key][bucket][p["pos"]] = (p["qty"], p["price"])
 
         if not employees:
             return f"📭 Нет данных за {date_str}."
@@ -199,10 +237,10 @@ def get_report(date_str: str) -> str:
         lines = [f"📊 Отчёт за {date_str}", ""]
         grand_total = 0.0
 
-        for key, e in employees.items():
+        for e in employees.values():
             role_short = ROLE_SHORT.get(e["role"], e["role"])
-            id_str = f" [ID: {e['tg_id']}]" if e["tg_id"] else ""
-            time_str = f"⏰ {e['start']}" + (f" – {e['end']}" if e["end"] else "")
+            id_str     = f" [ID: {e['tg_id']}]" if e["tg_id"] else ""
+            time_str   = f"⏰ {e['start']}" + (f" – {e['end']}" if e["end"] else "")
             lines.append(f"👤 {e['name']}{id_str} ({role_short}) | {e['branch']}")
             lines.append(time_str)
             emp_total = 0.0
@@ -402,7 +440,8 @@ def main_kb(role: str) -> InlineKeyboardMarkup:
     return kb(btns, cols=2)
 
 def profile_kb():
-    return kb([("🔄 Сменить роль", "change_role"), ("✏️ Сменить имя", "change_name"), ("🚀 Начать смену", "start_shift")], cols=1)
+    return kb([("🔄 Сменить роль", "change_role"), ("✏️ Сменить имя", "change_name"),
+               ("🚀 Начать смену", "start_shift")], cols=1)
 
 def new_session(user: dict, tid: int) -> dict:
     now = now_msk()
@@ -526,7 +565,8 @@ async def on_callback(update, ctx):
     except Exception as e:
         logger.error(f"[cb ERROR] user={tid} data={data} err={e}", exc_info=True)
         try:
-            await q.edit_message_text("⚠️ Ошибка. Нажмите /start", reply_markup=kb([("🔄 Начать заново", "restart")]))
+            await q.edit_message_text("⚠️ Ошибка. Нажмите /start",
+                                      reply_markup=kb([("🔄 Начать заново", "restart")]))
         except Exception:
             pass
 
@@ -535,7 +575,8 @@ async def _handle(q, ctx, data: str, tid: int):
         user = get_user(tid)
         if user:
             ctx.user_data["user"] = user
-            await q.edit_message_text(f"👋 {user['name']}!", reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1))
+            await q.edit_message_text(f"👋 {user['name']}!",
+                reply_markup=kb([("🚀 Начать смену", "start_shift"), ("👤 Профиль", "go_profile")], cols=1))
         else:
             await q.edit_message_text("Выберите своё имя:", reply_markup=names_kb())
         return
@@ -630,7 +671,8 @@ async def _handle(q, ctx, data: str, tid: int):
         s["branch"] = branch
         ctx.user_data["s"] = s
         await q.edit_message_text(
-            f"✅ Смена открыта!\n👤 {user['name']} | {ROLE_SHORT.get(user['role'], '')} | {branch}\n📅 {s['date']} {s['start_time']} МСК",
+            f"✅ Смена открыта!\n👤 {user['name']} | {ROLE_SHORT.get(user['role'], '')} | {branch}\n"
+            f"📅 {s['date']} {s['start_time']} МСК",
             reply_markup=main_kb(user["role"]),
         )
         return
@@ -696,7 +738,8 @@ async def _handle(q, ctx, data: str, tid: int):
             return
         ctx.user_data["cur_items"] = items
         ctx.user_data["cur_prefix"] = prefix
-        await q.edit_message_text(title, reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
+        await q.edit_message_text(title,
+            reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
         return
 
     if data.startswith("r_") or data.startswith("p_"):
@@ -713,7 +756,8 @@ async def _handle(q, ctx, data: str, tid: int):
         cur_str = f" (сейчас: {_qty_str(cur_qty)})" if cur_qty else ""
         await q.edit_message_text(
             f"📌 {name} — {price} руб{cur_str}\n\nВыберите количество:",
-            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
+            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),
+                             ("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
         )
         return
 
@@ -722,7 +766,8 @@ async def _handle(q, ctx, data: str, tid: int):
             items = ctx.user_data.get("cur_items", [])
             prefix = ctx.user_data.get("cur_prefix", "r")
             title = "➕ Ставки / подготовка:" if prefix == "r" else "➕ Процедуры:"
-            await q.edit_message_text(title, reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
+            await q.edit_message_text(title,
+                reply_markup=kb(_item_buttons(items, prefix, s) + [("◀️ Назад", "back_main")], cols=1))
             return
         name = ctx.user_data.get("cur_name", "")
         price = ctx.user_data.get("cur_price", 0)
@@ -739,7 +784,8 @@ async def _handle(q, ctx, data: str, tid: int):
             bucket[name] = new_qty
         await q.edit_message_text(
             f"📌 {name}\nКоличество: {_qty_str(new_qty)} → {int(price * new_qty)} руб\n\nВыберите количество:",
-            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
+            reply_markup=kb([("+1","qty_p1"),("+0.5","qty_p05"),
+                             ("-1","qty_m1"),("-0.5","qty_m05"),("◀️ К списку","qty_back")], cols=2),
         )
         return
 
@@ -795,7 +841,7 @@ def main():
     app.add_error_handler(err_handler)
     webhook_url = os.getenv("WEBHOOK_URL", "")
     port = int(os.getenv("PORT", "8080"))
-    logger.info("Бот Сансара v4.2 запускается...")
+    logger.info("Бот Сансара v4.3 запускается...")
     if webhook_url:
         full_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
         logger.info(f"Webhook URL: {full_url}")
