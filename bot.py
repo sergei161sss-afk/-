@@ -565,16 +565,28 @@ async def daily_report_job(context):
     except Exception as e:
         logger.error(f"daily_report_job: {e}")
 
+def get_tid_by_name(name: str) -> int | None:
+    """Ищет Telegram ID сотрудника по имени в users.json."""
+    users = _load_local()
+    for tid_str, data in users.items():
+        if data.get("name", "").strip() == name.strip():
+            try:
+                return int(tid_str)
+            except ValueError:
+                pass
+    return None
+
 async def late_check_job(context):
     """
     Проверка опозданий по расписанию каждые 30 мин (9:00–18:00 МСК).
     Контролируются только м1, м2, техпер.
-    Алерт отправляется однократно на каждого опоздавшего.
+    Алерт отправляется однократно на каждого опоздавшего:
+    - администратору — сводка по всем
+    - сотруднику лично — персональное напоминание
     """
     if not ADMIN_CHAT_ID:
         return
     now = now_msk()
-    # Работаем только в рабочие часы
     if not (9 <= now.hour < 18):
         return
 
@@ -594,13 +606,10 @@ async def late_check_job(context):
         late_people = []
         for entry in scheduled:
             name = entry["name"]
-            # Уже алертили, или уже на смене, или уже отработал
             if name in alerted or name in active_names or name in worked_names:
                 continue
-            # Проверяем: плановое время + 30 мин уже прошло?
             try:
                 sch_h, sch_m = map(int, entry["time"].split(":"))
-                # Grace period 30 минут
                 total_min = sch_h * 60 + sch_m + 30
                 grace_h, grace_m = divmod(total_min, 60)
                 if (now.hour, now.minute) >= (grace_h % 24, grace_m):
@@ -611,19 +620,33 @@ async def late_check_job(context):
         if not late_people:
             return
 
-        # Записываем что алерт отправлен
         if today not in LATE_ALERTS:
             LATE_ALERTS[today] = set()
         for entry in late_people:
             LATE_ALERTS[today].add(entry["name"])
 
+        # Сообщение администратору
         lines = [f"⚠️ Не вышли на смену ({today}):"]
         for entry in late_people:
             role_s = ROLE_SHORT.get(entry["role"], entry["role"])
             branch_s = f" | {entry['branch']}" if entry["branch"] else ""
             lines.append(f"  👤 {entry['name']} ({role_s}){branch_s} — план {entry['time']}")
-
         await context.bot.send_message(ADMIN_CHAT_ID, "\n".join(lines))
+
+        # Личное напоминание каждому опоздавшему
+        for entry in late_people:
+            emp_tid = get_tid_by_name(entry["name"])
+            if emp_tid is None:
+                logger.info(f"late_check: Telegram ID не найден для {entry['name']}")
+                continue
+            try:
+                await context.bot.send_message(
+                    emp_tid,
+                    f"⏰ {entry['name']}, твоя смена должна была начаться в {entry['time']}!\n"
+                    f"Не забудь открыть смену в боте — нажми /start"
+                )
+            except Exception as e:
+                logger.error(f"late_check: не удалось написать {entry['name']} (id={emp_tid}): {e}")
 
     except Exception as e:
         logger.error(f"late_check_job: {e}")
