@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Сансара — бот учёта смен v4
-- Без ConversationHandler (единый on_callback)
-- Пользователи синхронизируются в Google Sheets «Пользователи»
-- После закрытия смены: запись в «Журнал» + сводка администратору
-- Webhook на Railway (url_path=TOKEN), polling — локально
+Сансара — бот учёта смен v4.1
+- /report [дата] — отчёт администратора
+- Время начала смены записывается в Журнал
 """
 import os, json, logging
 from datetime import datetime
@@ -43,7 +41,7 @@ def _users_ws(sh):
     titles = [w.title for w in sh.worksheets()]
     if "Пользователи" not in titles:
         ws = sh.add_worksheet("Пользователи", rows=200, cols=3)
-        ws.update("A1:C1", [["telegram_id", "name", "role"]])
+        ws.update([["telegram_id", "name", "role"]], "A1:C1")
         return ws
     return sh.worksheet("Пользователи")
 
@@ -104,13 +102,17 @@ def set_user(tid: int, data: dict):
         values = ws.get_all_values()
         for i, row in enumerate(values):
             if row and str(row[0]).strip() == str(tid):
-                ws.update(f"A{i+1}:C{i+1}", [[str(tid), data["name"], data["role"]]])
+                ws.update([[str(tid), data["name"], data["role"]]], f"A{i+1}:C{i+1}")
                 return
         ws.append_row([str(tid), data["name"], data["role"]])
     except Exception as e:
         logger.error(f"set_user sheets sync: {e}")
 
 def write_shift(s: dict):
+    """
+    Журнал колонки:
+    date | name | role | branch | start_time | end_time | type | position | qty | price | amount | period | day | month | year
+    """
     try:
         sh = _open_sheet()
         if sh is None:
@@ -121,23 +123,111 @@ def write_shift(s: dict):
         parts = date_str.split(".")
         day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
         period = "1-15" if day <= 15 else "16-31"
+        start_time = s.get("start_time", "")
+        end_time = s.get("end_time", "")
         cat = CATALOGUE.get(s["role"], {}).get(s["branch"], {})
         rows = []
         rates_dict = dict(cat.get("ставки", []))
         for pos, qty in s.get("ставки", {}).items():
             price = rates_dict.get(pos, 0)
-            rows.append([date_str, s["name"], s["role"], s["branch"], "ставка",
-                         pos, qty, price, round(price * qty, 2), period, day, month, year])
+            rows.append([date_str, s["name"], s["role"], s["branch"],
+                         start_time, end_time, "ставка",
+                         pos, qty, price, round(price * qty, 2),
+                         period, day, month, year])
         procs_dict = dict(cat.get("процедуры", []))
         for pos, qty in s.get("процедуры", {}).items():
             price = procs_dict.get(pos, 0)
-            rows.append([date_str, s["name"], s["role"], s["branch"], "процедура",
-                         pos, qty, price, round(price * qty, 2), period, day, month, year])
+            rows.append([date_str, s["name"], s["role"], s["branch"],
+                         start_time, end_time, "процедура",
+                         pos, qty, price, round(price * qty, 2),
+                         period, day, month, year])
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
             logger.info(f"Журнал: {len(rows)} строк для {s['name']}")
     except Exception as e:
         logger.error(f"write_shift: {e}")
+
+def get_report(date_str: str) -> str:
+    """Читает Журнал и формирует отчёт за дату DD.MM.YYYY."""
+    try:
+        sh = _open_sheet()
+        if sh is None:
+            return "❌ Google Sheets не подключены."
+        ws = sh.worksheet("Журнал")
+        rows = ws.get_all_values()
+        if not rows:
+            return f"📭 Нет данных за {date_str}."
+
+        # Группируем по (name, role, branch, start_time)
+        employees = {}  # key -> {info, ставки: {pos: (qty,price)}, процедуры: {pos: (qty,price)}}
+        for row in rows:
+            if len(row) < 11:
+                continue
+            if row[0] != date_str:
+                continue
+            name       = row[1]
+            role       = row[2]
+            branch     = row[3]
+            start_time = row[4] if len(row) > 4 else ""
+            end_time   = row[5] if len(row) > 5 else ""
+            rtype      = row[6] if len(row) > 6 else row[4]  # обратная совместимость
+            pos        = row[7] if len(row) > 7 else row[5]
+            try:
+                qty   = float(str(row[8] if len(row) > 8 else row[6]).replace(",", "."))
+                price = float(str(row[9] if len(row) > 9 else row[7]).replace(",", "."))
+            except (ValueError, IndexError):
+                continue
+
+            key = (name, role, branch, start_time)
+            if key not in employees:
+                employees[key] = {
+                    "name": name, "role": role, "branch": branch,
+                    "start": start_time, "end": end_time,
+                    "ставки": {}, "процедуры": {},
+                }
+            bucket = "ставки" if rtype == "ставка" else "процедуры"
+            employees[key][bucket][pos] = (qty, price)
+
+        if not employees:
+            return f"📭 Нет данных за {date_str}."
+
+        lines = [f"📊 Отчёт за {date_str}", ""]
+        grand_total = 0.0
+
+        for key, e in employees.items():
+            role_short = ROLE_SHORT.get(e["role"], e["role"])
+            time_str = f"⏰ {e['start']}" + (f" – {e['end']}" if e["end"] else "")
+            lines.append(f"👤 {e['name']} ({role_short}) | {e['branch']}")
+            lines.append(time_str)
+            emp_total = 0.0
+
+            if e["ставки"]:
+                lines.append("  Ставки:")
+                for pos, (qty, price) in e["ставки"].items():
+                    amt = qty * price
+                    emp_total += amt
+                    q = str(int(qty)) if qty == int(qty) else str(qty)
+                    lines.append(f"    {pos}: {q} × {int(price)} = {int(amt)} руб")
+
+            if e["процедуры"]:
+                lines.append("  Процедуры:")
+                for pos, (qty, price) in e["процедуры"].items():
+                    amt = qty * price
+                    emp_total += amt
+                    q = str(int(qty)) if qty == int(qty) else str(qty)
+                    lines.append(f"    {pos}: {q} × {int(price)} = {int(amt)} руб")
+
+            lines.append(f"  💰 Итого: {int(emp_total)} руб")
+            lines.append("")
+            grand_total += emp_total
+
+        lines.append("─" * 30)
+        lines.append(f"💵 ОБЩАЯ СУММА: {int(grand_total)} руб")
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"get_report: {e}")
+        return f"❌ Ошибка при получении отчёта: {e}"
 
 # ── Данные ────────────────────────────────────────────────────────────────────
 
@@ -419,6 +509,29 @@ async def cmd_myid(update, ctx):
         parse_mode="Markdown",
     )
 
+async def cmd_report(update, ctx):
+    """
+    /report          — отчёт за сегодня
+    /report 30.06.2026 — отчёт за указанную дату
+    """
+    tid = update.effective_user.id
+    # Проверка доступа: только администратор
+    if ADMIN_CHAT_ID and tid != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Команда доступна только администратору.")
+        return
+
+    args = ctx.args
+    if args:
+        date_str = args[0]
+    else:
+        date_str = datetime.now().strftime("%d.%m.%Y")
+
+    await update.message.reply_text(f"⏳ Формирую отчёт за {date_str}...")
+    report = get_report(date_str)
+    # Telegram ограничивает сообщения 4096 символами
+    for i in range(0, len(report), 4000):
+        await update.message.reply_text(report[i:i+4000])
+
 # ── Единый обработчик кнопок ──────────────────────────────────────────────────
 
 async def on_callback(update, ctx):
@@ -466,9 +579,7 @@ async def _handle(q, ctx, data: str, tid: int):
             )
         else:
             ctx.user_data["reg_name"] = name
-            await q.edit_message_text(
-                f"👤 Имя: {name}\n\nВыберите роль:", reply_markup=roles_kb()
-            )
+            await q.edit_message_text(f"👤 Имя: {name}\n\nВыберите роль:", reply_markup=roles_kb())
         return
 
     if data.startswith("rr_"):
@@ -482,9 +593,7 @@ async def _handle(q, ctx, data: str, tid: int):
             user["role"] = role
             set_user(tid, user)
             ctx.user_data["user"] = user
-            await q.edit_message_text(
-                f"✅ Роль изменена: {ROLE_LABELS[role]}", reply_markup=profile_kb(),
-            )
+            await q.edit_message_text(f"✅ Роль изменена: {ROLE_LABELS[role]}", reply_markup=profile_kb())
         else:
             name = ctx.user_data.get("reg_name", "")
             if not name:
@@ -731,6 +840,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     async def err_handler(update, ctx):
@@ -740,16 +850,15 @@ def main():
     webhook_url = os.getenv("WEBHOOK_URL", "")
     port = int(os.getenv("PORT", "8080"))
 
-    logger.info("Бот Сансара v4 запускается...")
+    logger.info("Бот Сансара v4.1 запускается...")
     if webhook_url:
-        # PTB слушает по пути /{TOKEN}, поэтому и Telegram должен слать туда же
-        full_webhook_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
-        logger.info(f"Webhook URL: {full_webhook_url}")
+        full_url = f"{webhook_url.rstrip('/')}/{TOKEN}"
+        logger.info(f"Webhook URL: {full_url}")
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=TOKEN,
-            webhook_url=full_webhook_url,
+            webhook_url=full_url,
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
         )
