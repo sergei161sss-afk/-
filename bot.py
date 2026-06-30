@@ -569,7 +569,7 @@ async def post_init(application: Application) -> None:
     # Ежедневный отчёт в 21:00 МСК
     jq.run_daily(
         daily_report_job,
-        time=datetime.time(21, 0, 0, tzinfo=MSK_TZ),
+        time=datetime.time(23, 55, 0, tzinfo=MSK_TZ),
         name="daily_report",
     )
     # Проверка опозданий в 11:00 МСК
