@@ -1210,6 +1210,14 @@ async def _handle(q, ctx, data: str, tid: int):
             reply_markup=kb(_item_buttons(items, prefix, s) + [("Назад", "back_main")], cols=1))
         return
 
+    if data == "cancel_sale":
+        ctx.user_data.pop("waiting_sale", None)
+        await q.edit_message_text(
+            f"👤 {s.get('name', '')} | {s.get('branch', '')} | {s.get('date', '')}",
+            reply_markup=main_kb(s.get("role", "")),
+        )
+        return
+
     if data == "add_sale":
         if not s.get("branch"):
             await q.edit_message_text("Смена не открыта. Нажмите /start")
@@ -1218,7 +1226,8 @@ async def _handle(q, ctx, data: str, tid: int):
         await q.edit_message_text(
             "Доп продажа\n\n"
             "Введите сумму продажи в рублях — получите 10% комиссию.\n\n"
-            "Пример: 5000"
+            "Пример: 5000",
+            reply_markup=kb([("Назад", "cancel_sale")]),
         )
         return
 
